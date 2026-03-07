@@ -1245,7 +1245,9 @@ function createMdMirrorWriter(
   return async (entry, meta) => {
     try {
       const ts = new Date(entry.timestamp || Date.now());
-      const dateStr = ts.toISOString().split("T")[0];
+      // Use host local date for human-readable mirror filenames (YYYY-MM-DD)
+      const d = ts;
+      const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
       let mirrorDir = fallbackDir;
       if (meta?.agentId && workspaceMap[meta.agentId]) {
