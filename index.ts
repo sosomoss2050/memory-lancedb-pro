@@ -23,7 +23,6 @@ import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
-import { AccessTracker } from "./src/access-tracker.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
 import {
@@ -33,11 +32,26 @@ import {
 } from "./src/reflection-store.js";
 import {
   extractReflectionLearningGovernanceCandidates,
-  extractReflectionMappedMemoryItems,
+  extractInjectableReflectionMappedMemoryItems,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
+import { isNoise } from "./src/noise-filter.js";
+
+// Import smart extraction & lifecycle components
+import { SmartExtractor } from "./src/smart-extractor.js";
+import { NoisePrototypeBank } from "./src/noise-prototypes.js";
+import { createLlmClient } from "./src/llm-client.js";
+import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
+import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
+import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import {
+  buildSmartMetadata,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+  toLifecycleMemory,
+} from "./src/smart-metadata.js";
 
 // ============================================================================
 // Configuration & Types
@@ -46,7 +60,7 @@ import { createMemoryCLI } from "./cli.js";
 interface PluginConfig {
   embedding: {
     provider: "openai-compatible";
-    apiKey: string;
+    apiKey: string | string[];
     model?: string;
     baseURL?: string;
     dimensions?: number;
@@ -71,7 +85,7 @@ interface PluginConfig {
     rerankApiKey?: string;
     rerankModel?: string;
     rerankEndpoint?: string;
-    rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone";
+    rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone" | "dashscope";
     recencyHalfLifeDays?: number;
     recencyWeight?: number;
     filterNoise?: boolean;
@@ -81,6 +95,39 @@ interface PluginConfig {
     reinforcementFactor?: number;
     maxHalfLifeMultiplier?: number;
   };
+  decay?: {
+    recencyHalfLifeDays?: number;
+    recencyWeight?: number;
+    frequencyWeight?: number;
+    intrinsicWeight?: number;
+    staleThreshold?: number;
+    searchBoostMin?: number;
+    importanceModulation?: number;
+    betaCore?: number;
+    betaWorking?: number;
+    betaPeripheral?: number;
+    coreDecayFloor?: number;
+    workingDecayFloor?: number;
+    peripheralDecayFloor?: number;
+  };
+  tier?: {
+    coreAccessThreshold?: number;
+    coreCompositeThreshold?: number;
+    coreImportanceThreshold?: number;
+    peripheralCompositeThreshold?: number;
+    peripheralAgeDays?: number;
+    workingAccessThreshold?: number;
+    workingCompositeThreshold?: number;
+  };
+  // Smart extraction config
+  smartExtraction?: boolean;
+  llm?: {
+    apiKey?: string;
+    model?: string;
+    baseURL?: string;
+  };
+  extractMinMessages?: number;
+  extractMaxChars?: number;
   scopes?: {
     default?: string;
     definitions?: Record<string, { description: string }>;
@@ -158,6 +205,56 @@ function parsePositiveInt(value: unknown): number | undefined {
   return undefined;
 }
 
+function resolveHookAgentId(
+  explicitAgentId: string | undefined,
+  sessionKey: string | undefined,
+): string {
+  return explicitAgentId || parseAgentIdFromSessionKey(sessionKey) || "main";
+}
+
+function summarizeAgentEndMessages(messages: unknown[]): string {
+  const roleCounts = new Map<string, number>();
+  let textBlocks = 0;
+  let stringContents = 0;
+  let arrayContents = 0;
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const msgObj = msg as Record<string, unknown>;
+    const role =
+      typeof msgObj.role === "string" && msgObj.role.trim().length > 0
+        ? msgObj.role
+        : "unknown";
+    roleCounts.set(role, (roleCounts.get(role) ?? 0) + 1);
+
+    const content = msgObj.content;
+    if (typeof content === "string") {
+      stringContents++;
+      continue;
+    }
+    if (Array.isArray(content)) {
+      arrayContents++;
+      for (const block of content) {
+        if (
+          block &&
+          typeof block === "object" &&
+          (block as Record<string, unknown>).type === "text" &&
+          typeof (block as Record<string, unknown>).text === "string"
+        ) {
+          textBlocks++;
+        }
+      }
+    }
+  }
+
+  const roles =
+    Array.from(roleCounts.entries())
+      .map(([role, count]) => `${role}:${count}`)
+      .join(", ") || "none";
+
+  return `messages=${messages.length}, roles=[${roles}], stringContents=${stringContents}, arrayContents=${arrayContents}, textBlocks=${textBlocks}`;
+}
+
 const DEFAULT_SELF_IMPROVEMENT_REMINDER = `## Self-Improvement Reminder
 
 After completing tasks, evaluate if any learnings should be captured:
@@ -216,7 +313,6 @@ function toImportSpecifier(value: string): string {
   if (trimmed.startsWith("/")) return pathToFileURL(trimmed).href;
   return trimmed;
 }
-
 function getExtensionApiImportSpecifiers(): string[] {
   const envPath = process.env.OPENCLAW_EXTENSION_API_PATH?.trim();
   const specifiers: string[] = [];
@@ -530,6 +626,11 @@ function extractTextContent(content: unknown): string | null {
   return null;
 }
 
+/**
+ * Check if a message should be skipped (slash commands, injected recall/system blocks).
+ * Used by both the **reflection** pipeline (session JSONL reading) and the
+ * **auto-capture** pipeline (via `normalizeAutoCaptureText`) as a final guard.
+ */
 function shouldSkipReflectionMessage(role: string, text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
@@ -546,6 +647,158 @@ function shouldSkipReflectionMessage(role: string, text: string): boolean {
   }
 
   return false;
+}
+
+const AUTO_CAPTURE_INBOUND_META_SENTINELS = [
+  "Conversation info (untrusted metadata):",
+  "Sender (untrusted metadata):",
+  "Thread starter (untrusted, for context):",
+  "Replied message (untrusted, for context):",
+  "Forwarded message context (untrusted metadata):",
+  "Chat history since last reply (untrusted, for context):",
+] as const;
+
+const AUTO_CAPTURE_SESSION_RESET_PREFIX =
+  "A new session was started via /new or /reset. Execute your Session Startup sequence now";
+const AUTO_CAPTURE_ADDRESSING_PREFIX_RE = /^(?:<@!?[0-9]+>|@[A-Za-z0-9_.-]+)\s*/;
+const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
+const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
+  /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
+
+function isAutoCaptureInboundMetaSentinelLine(line: string): boolean {
+  const trimmed = line.trim();
+  return AUTO_CAPTURE_INBOUND_META_SENTINELS.some((sentinel) => sentinel === trimmed);
+}
+
+function stripLeadingInboundMetadata(text: string): string {
+  if (!text || !AUTO_CAPTURE_INBOUND_META_SENTINELS.some((sentinel) => text.includes(sentinel))) {
+    return text;
+  }
+
+  const lines = text.split("\n");
+  let index = 0;
+  while (index < lines.length && lines[index].trim() === "") {
+    index++;
+  }
+
+  while (index < lines.length && isAutoCaptureInboundMetaSentinelLine(lines[index])) {
+    index++;
+    if (index < lines.length && lines[index].trim() === "```json") {
+      index++;
+      while (index < lines.length && lines[index].trim() !== "```") {
+        index++;
+      }
+      if (index < lines.length && lines[index].trim() === "```") {
+        index++;
+      }
+    } else {
+      // Sentinel line not followed by a ```json fenced block — unexpected format.
+      // Log and return original text to avoid lossy stripping.
+      _autoCaptureDebugLog(
+        `memory-lancedb-pro: stripLeadingInboundMetadata: sentinel line not followed by json fenced block at line ${index}, returning original text`,
+      );
+      return text;
+    }
+
+    while (index < lines.length && lines[index].trim() === "") {
+      index++;
+    }
+  }
+
+  return lines.slice(index).join("\n").trim();
+}
+
+/**
+ * Prune a Map to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) keys when over the limit.
+ */
+function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
+  if (map.size <= maxEntries) return;
+  const excess = map.size - maxEntries;
+  const iter = map.keys();
+  for (let i = 0; i < excess; i++) {
+    const key = iter.next().value;
+    if (key !== undefined) map.delete(key);
+  }
+}
+
+function stripAutoCaptureSessionResetPrefix(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith(AUTO_CAPTURE_SESSION_RESET_PREFIX)) {
+    return trimmed;
+  }
+
+  const blankLineIndex = trimmed.indexOf("\n\n");
+  if (blankLineIndex >= 0) {
+    return trimmed.slice(blankLineIndex + 2).trim();
+  }
+
+  const lines = trimmed.split("\n");
+  if (lines.length <= 2) {
+    return "";
+  }
+  return lines.slice(2).join("\n").trim();
+}
+
+function stripAutoCaptureAddressingPrefix(text: string): string {
+  return text.replace(AUTO_CAPTURE_ADDRESSING_PREFIX_RE, "").trim();
+}
+
+function isExplicitRememberCommand(text: string): boolean {
+  return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
+}
+
+function buildAutoCaptureConversationKeyFromIngress(
+  channelId: string | undefined,
+  conversationId: string | undefined,
+): string | null {
+  const channel = typeof channelId === "string" ? channelId.trim() : "";
+  const conversation = typeof conversationId === "string" ? conversationId.trim() : "";
+  if (!channel || !conversation) return null;
+  return `${channel}:${conversation}`;
+}
+
+/**
+ * Extract the conversation portion from a sessionKey.
+ * Expected format: `agent:<agentId>:<channelId>:<conversationId>`
+ * where `<agentId>` does not contain colons. Returns everything after
+ * the second colon as the conversation key, or null if the format
+ * does not match.
+ */
+function buildAutoCaptureConversationKeyFromSessionKey(sessionKey: string): string | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed) return null;
+  const match = /^agent:[^:]+:(.+)$/.exec(trimmed);
+  const suffix = match?.[1]?.trim();
+  return suffix || null;
+}
+
+function stripAutoCaptureInjectedPrefix(role: string, text: string): string {
+  if (role !== "user") {
+    return text.trim();
+  }
+
+  let normalized = text.trim();
+  normalized = normalized.replace(/^<relevant-memories>\s*[\s\S]*?<\/relevant-memories>\s*/i, "");
+  normalized = normalized.replace(
+    /^\[UNTRUSTED DATA[^\n]*\][\s\S]*?\[END UNTRUSTED DATA\]\s*/i,
+    "",
+  );
+  normalized = stripAutoCaptureSessionResetPrefix(normalized);
+  normalized = stripLeadingInboundMetadata(normalized);
+  normalized = stripAutoCaptureAddressingPrefix(normalized);
+  return normalized.trim();
+}
+
+/** Module-level debug logger for auto-capture helpers; set during plugin registration. */
+let _autoCaptureDebugLog: (msg: string) => void = () => { };
+
+function normalizeAutoCaptureText(role: unknown, text: string): string | null {
+  if (typeof role !== "string") return null;
+  const normalized = stripAutoCaptureInjectedPrefix(role, text);
+  if (!normalized) return null;
+  if (shouldSkipReflectionMessage(role, normalized)) return null;
+  return normalized;
 }
 
 function redactSecrets(text: string): string {
@@ -1102,6 +1355,39 @@ function sanitizeForContext(text: string): string {
     .slice(0, 300);
 }
 
+function summarizeTextPreview(text: string, maxLen = 120): string {
+  return JSON.stringify(sanitizeForContext(text).slice(0, maxLen));
+}
+
+function summarizeMessageContent(content: unknown): string {
+  if (typeof content === "string") {
+    const trimmed = content.trim();
+    return `string(len=${trimmed.length}, preview=${summarizeTextPreview(trimmed)})`;
+  }
+  if (Array.isArray(content)) {
+    const textBlocks: string[] = [];
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as Record<string, unknown>).type === "text" &&
+        typeof (block as Record<string, unknown>).text === "string"
+      ) {
+        textBlocks.push((block as Record<string, unknown>).text as string);
+      }
+    }
+    const combined = textBlocks.join(" ").trim();
+    return `array(blocks=${content.length}, textBlocks=${textBlocks.length}, textLen=${combined.length}, preview=${summarizeTextPreview(combined)})`;
+  }
+  return `type=${Array.isArray(content) ? "array" : typeof content}`;
+}
+
+function summarizeCaptureDecision(text: string): string {
+  const trimmed = text.trim();
+  const preview = sanitizeForContext(trimmed).slice(0, 120);
+  return `len=${trimmed.length}, trigger=${shouldCapture(trimmed) ? "Y" : "N"}, noise=${isNoise(trimmed) ? "Y" : "N"}, preview=${JSON.stringify(preview)}`;
+}
+
 // ============================================================================
 // Session Path Helpers
 // ============================================================================
@@ -1177,7 +1463,7 @@ async function findPreviousSessionFile(
       );
       if (nonReset.length > 0) return join(sessionsDir, nonReset[0]);
     }
-  } catch {}
+  } catch { }
 }
 
 // ============================================================================
@@ -1310,7 +1596,7 @@ const memoryLanceDBProPlugin = {
     } catch (err) {
       api.logger.warn(
         `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-          `  The plugin will still attempt to start, but writes may fail.`,
+        `  The plugin will still attempt to start, but writes may fail.`,
       );
     }
 
@@ -1332,22 +1618,170 @@ const memoryLanceDBProPlugin = {
       normalized: config.embedding.normalized,
       chunking: config.embedding.chunking,
     });
-    const retriever = createRetriever(store, embedder, {
-      ...DEFAULT_RETRIEVAL_CONFIG,
-      ...config.retrieval,
+    // Initialize decay engine
+    const decayEngine = createDecayEngine({
+      ...DEFAULT_DECAY_CONFIG,
+      ...(config.decay || {}),
     });
-
-    // Access reinforcement tracker (debounced write-back)
-    const accessTracker = new AccessTracker({
+    const tierManager = createTierManager({
+      ...DEFAULT_TIER_CONFIG,
+      ...(config.tier || {}),
+    });
+    const retriever = createRetriever(
       store,
-      logger: api.logger,
-      debounceMs: 5000,
-    });
-    retriever.setAccessTracker(accessTracker);
-
+      embedder,
+      {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        ...config.retrieval,
+      },
+      { decayEngine },
+    );
     const scopeManager = createScopeManager(config.scopes);
     const migrator = createMigrator(store);
 
+    // Initialize smart extraction
+    let smartExtractor: SmartExtractor | null = null;
+    if (config.smartExtraction !== false) {
+      try {
+        const llmApiKey = config.llm?.apiKey
+          ? resolveEnvVars(config.llm.apiKey)
+          : resolveEnvVars(config.embedding.apiKey);
+        const llmBaseURL = config.llm?.baseURL
+          ? resolveEnvVars(config.llm.baseURL)
+          : config.embedding.baseURL;
+        const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+
+        const llmClient = createLlmClient({
+          apiKey: llmApiKey,
+          model: llmModel,
+          baseURL: llmBaseURL,
+          timeoutMs: 30000,
+          log: (msg: string) => api.logger.debug(msg),
+        });
+
+        // Initialize embedding-based noise prototype bank (async, non-blocking)
+        const noiseBank = new NoisePrototypeBank(
+          (msg: string) => api.logger.debug(msg),
+        );
+        noiseBank.init(embedder).catch((err) =>
+          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+        );
+
+        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+          user: "User",
+          extractMinMessages: config.extractMinMessages ?? 2,
+          extractMaxChars: config.extractMaxChars ?? 8000,
+          defaultScope: config.scopes?.default ?? "global",
+          log: (msg: string) => api.logger.info(msg),
+          debugLog: (msg: string) => api.logger.debug(msg),
+          noiseBank,
+        });
+
+        api.logger.info("memory-lancedb-pro: smart extraction enabled (LLM model: " + llmModel + ", noise bank: ON)");
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+      }
+    }
+
+    async function sleep(ms: number): Promise<void> {
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function retrieveWithRetry(params: {
+      query: string;
+      limit: number;
+      scopeFilter?: string[];
+      category?: string;
+    }) {
+      let results = await retriever.retrieve(params);
+      if (results.length === 0) {
+        await sleep(75);
+        results = await retriever.retrieve(params);
+      }
+      return results;
+    }
+
+    async function runRecallLifecycle(
+      results: Array<{ entry: { id: string; text: string; category: "preference" | "fact" | "decision" | "entity" | "other"; scope: string; importance: number; timestamp: number; metadata?: string } }>,
+      scopeFilter: string[],
+    ): Promise<Map<string, string>> {
+      const now = Date.now();
+      type LifecycleEntry = {
+        id: string;
+        text: string;
+        category: "preference" | "fact" | "decision" | "entity" | "other";
+        scope: string;
+        importance: number;
+        timestamp: number;
+        metadata?: string;
+      };
+      const lifecycleEntries = new Map<string, LifecycleEntry>();
+      const tierOverrides = new Map<string, string>();
+
+      await Promise.allSettled(
+        results.map(async (result) => {
+          const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+          const updated = await store.patchMetadata(
+            result.entry.id,
+            {
+              access_count: metadata.access_count + 1,
+              last_accessed_at: now,
+            },
+            scopeFilter,
+          );
+          lifecycleEntries.set(result.entry.id, updated ?? result.entry);
+        }),
+      );
+
+      try {
+        const recentEntries = await store.list(scopeFilter, undefined, 100, 0);
+        for (const entry of recentEntries) {
+          if (!lifecycleEntries.has(entry.id)) {
+            lifecycleEntries.set(entry.id, entry);
+          }
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance preload failed: ${String(err)}`);
+      }
+
+      const candidates = Array.from(lifecycleEntries.values())
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+        .filter((entry) => parseSmartMetadata(entry.metadata, entry).type !== "session-summary");
+
+      if (candidates.length === 0) {
+        return tierOverrides;
+      }
+
+      try {
+        const memories = candidates.map((entry) => toLifecycleMemory(entry.id, entry));
+        const decayScores = decayEngine.scoreAll(memories, now);
+        const transitions = tierManager.evaluateAll(memories, decayScores, now);
+
+        await Promise.allSettled(
+          transitions.map(async (transition) => {
+            await store.patchMetadata(
+              transition.memoryId,
+              {
+                tier: transition.toTier,
+                tier_updated_at: now,
+              },
+              scopeFilter,
+            );
+            tierOverrides.set(transition.memoryId, transition.toTier);
+          }),
+        );
+
+        if (transitions.length > 0) {
+          api.logger.info(
+            `memory-lancedb-pro: tier maintenance applied ${transitions.length} transition(s)`,
+          );
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance failed: ${String(err)}`);
+      }
+
+      return tierOverrides;
+    }
     const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
     const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
     const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
@@ -1441,10 +1875,51 @@ const memoryLanceDBProPlugin = {
     // Map<sessionId, turnCounter> - manual turn tracking per session
     const turnCounter = new Map<string, number>();
 
+    // Track how many normalized user texts have already been seen per session snapshot.
+    // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
+    // growth in long-running processes with many distinct sessions.
+    const autoCaptureSeenTextCount = new Map<string, number>();
+    const autoCapturePendingIngressTexts = new Map<string, string[]>();
+    const autoCaptureRecentTexts = new Map<string, string[]>();
+
+    // Wire up the module-level debug logger for pure helper functions.
+    _autoCaptureDebugLog = (msg: string) => api.logger.debug(msg);
+
     api.logger.info(
-      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
+      `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
     );
     api.logger.info(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+
+    api.on("message_received", (event, ctx) => {
+      const conversationKey = buildAutoCaptureConversationKeyFromIngress(
+        ctx.channelId,
+        ctx.conversationId,
+      );
+      const normalized = normalizeAutoCaptureText("user", event.content);
+      if (conversationKey && normalized) {
+        const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
+        queue.push(normalized);
+        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
+        pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+      }
+      api.logger.debug(
+        `memory-lancedb-pro: ingress message_received channel=${ctx.channelId} account=${ctx.accountId || "unknown"} conversation=${ctx.conversationId || "unknown"} from=${event.from} len=${event.content.trim().length} preview=${summarizeTextPreview(event.content)}`,
+      );
+    });
+
+    api.on("before_message_write", (event, ctx) => {
+      const message = event.message as Record<string, unknown> | undefined;
+      const role =
+        message && typeof message.role === "string" && message.role.trim().length > 0
+          ? message.role
+          : "unknown";
+      if (role !== "user") {
+        return;
+      }
+      api.logger.debug(
+        `memory-lancedb-pro: ingress before_message_write agent=${ctx.agentId || event.agentId || "unknown"} sessionKey=${ctx.sessionKey || event.sessionKey || "unknown"} role=${role} ${summarizeMessageContent(message?.content)}`,
+      );
+    });
 
     // ========================================================================
     // Markdown Mirror
@@ -1484,6 +1959,22 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         migrator,
         embedder,
+        llmClient: smartExtractor ? (() => {
+          try {
+            const llmApiKey = config.llm?.apiKey
+              ? resolveEnvVars(config.llm.apiKey)
+              : resolveEnvVars(config.embedding.apiKey);
+            const llmBaseURL = config.llm?.baseURL
+              ? resolveEnvVars(config.llm.baseURL)
+              : config.embedding.baseURL;
+            return createLlmClient({
+              apiKey: llmApiKey,
+              model: config.llm?.model || "openai/gpt-oss-120b",
+              baseURL: llmBaseURL,
+              timeoutMs: 30000,
+            });
+          } catch { return undefined; }
+        })() : undefined,
       }),
       { commands: ["memory-pro"] },
     );
@@ -1510,10 +2001,10 @@ const memoryLanceDBProPlugin = {
 
         try {
           // Determine agent ID and accessible scopes
-          const agentId = ctx?.agentId || "main";
+          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
-          const results = await retriever.retrieve({
+          const results = await retrieveWithRetry({
             query: event.prompt,
             limit: 3,
             scopeFilter: accessibleScopes,
@@ -1524,6 +2015,7 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
+          const tierOverrides = await runRecallLifecycle(results, accessibleScopes);
           // Filter out redundant memories based on session history
           const minRepeated = config.autoRecallMinRepeated ?? 0;
 
@@ -1564,10 +2056,14 @@ const memoryLanceDBProPlugin = {
           }
 
           const memoryContext = finalResults
-            .map(
-              (r) =>
-                `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`,
-            )
+            .map((r) => {
+              const metaObj = parseSmartMetadata(r.entry.metadata, r.entry);
+              const displayCategory = metaObj.memory_category || r.entry.category;
+              const displayTier = tierOverrides.get(r.entry.id) || metaObj.tier || "";
+              const tierPrefix = displayTier ? `[${displayTier.charAt(0).toUpperCase()}]` : "";
+              const abstract = metaObj.l0_abstract || r.entry.text;
+              return `- ${tierPrefix}[${displayCategory}:${r.entry.scope}] ${sanitizeForContext(abstract)}`;
+            })
             .join("\n");
 
           api.logger.info?.(
@@ -1597,11 +2093,18 @@ const memoryLanceDBProPlugin = {
 
         try {
           // Determine agent ID and default scope
-          const agentId = ctx?.agentId || "main";
+          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
           const defaultScope = scopeManager.getDefaultScope(agentId);
+          const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
+
+          api.logger.debug(
+            `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
+          );
 
           // Extract text content from messages
-          const texts: string[] = [];
+          const eligibleTexts: string[] = [];
+          let skippedAutoCaptureTexts = 0;
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -1620,7 +2123,12 @@ const memoryLanceDBProPlugin = {
             const content = msgObj.content;
 
             if (typeof content === "string") {
-              texts.push(content);
+              const normalized = normalizeAutoCaptureText(role, content);
+              if (!normalized) {
+                skippedAutoCaptureTexts++;
+              } else {
+                eligibleTexts.push(normalized);
+              }
               continue;
             }
 
@@ -1634,17 +2142,143 @@ const memoryLanceDBProPlugin = {
                   "text" in block &&
                   typeof (block as Record<string, unknown>).text === "string"
                 ) {
-                  texts.push((block as Record<string, unknown>).text as string);
+                  const text = (block as Record<string, unknown>).text as string;
+                  const normalized = normalizeAutoCaptureText(role, text);
+                  if (!normalized) {
+                    skippedAutoCaptureTexts++;
+                  } else {
+                    eligibleTexts.push(normalized);
+                  }
                 }
               }
             }
           }
 
-          // Filter for capturable content
-          const toCapture = texts.filter((text) => text && shouldCapture(text));
-          if (toCapture.length === 0) {
+          const conversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+          const pendingIngressTexts = conversationKey
+            ? [...(autoCapturePendingIngressTexts.get(conversationKey) || [])]
+            : [];
+          if (conversationKey) {
+            autoCapturePendingIngressTexts.delete(conversationKey);
+          }
+
+          const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+          let newTexts = eligibleTexts;
+          if (pendingIngressTexts.length > 0) {
+            newTexts = pendingIngressTexts;
+          } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
+            newTexts = eligibleTexts.slice(previousSeenCount);
+          }
+          autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
+          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+
+          const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
+          let texts = newTexts;
+          if (
+            texts.length === 1 &&
+            isExplicitRememberCommand(texts[0]) &&
+            priorRecentTexts.length > 0
+          ) {
+            texts = [...priorRecentTexts.slice(-1), ...texts];
+          }
+          if (newTexts.length > 0) {
+            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
+            autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
+            pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+
+          const minMessages = config.extractMinMessages ?? 2;
+          if (skippedAutoCaptureTexts > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
+            );
+          }
+          if (pendingIngressTexts.length > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture using ${pendingIngressTexts.length} pending ingress text(s) for agent ${agentId}`,
+            );
+          }
+          if (texts.length !== eligibleTexts.length) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture narrowed ${eligibleTexts.length} eligible history text(s) to ${texts.length} new text(s) for agent ${agentId}`,
+            );
+          }
+          api.logger.debug(
+            `memory-lancedb-pro: auto-capture collected ${texts.length} text(s) for agent ${agentId} (minMessages=${minMessages}, smartExtraction=${smartExtractor ? "on" : "off"})`,
+          );
+          if (texts.length === 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture found no eligible texts after filtering for agent ${agentId}`,
+            );
             return;
           }
+          if (texts.length > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture text diagnostics for agent ${agentId}: ${texts.map((text, idx) => `#${idx + 1}(${summarizeCaptureDecision(text)})`).join(" | ")}`,
+            );
+          }
+
+          // ----------------------------------------------------------------
+          // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
+          // ----------------------------------------------------------------
+          if (smartExtractor) {
+            // Pre-filter: embedding-based noise detection (language-agnostic)
+            const cleanTexts = await smartExtractor.filterNoiseByEmbedding(texts);
+            if (cleanTexts.length === 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: all texts filtered as embedding noise for agent ${agentId}`,
+              );
+              return;
+            }
+            if (cleanTexts.length >= minMessages) {
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
+              );
+              const conversationText = cleanTexts.join("\n");
+              const stats = await smartExtractor.extractAndPersist(
+                conversationText, sessionKey,
+                { scope: defaultScope, scopeFilter: accessibleScopes },
+              );
+              if (stats.created > 0 || stats.merged > 0) {
+                api.logger.info(
+                  `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`
+                );
+                return; // Smart extraction handled everything
+              }
+
+              api.logger.info(
+                `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
+              );
+            } else {
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages})`,
+              );
+            }
+          }
+
+          api.logger.debug(
+            `memory-lancedb-pro: auto-capture running regex fallback for agent ${agentId}`,
+          );
+
+          // ----------------------------------------------------------------
+          // Fallback: regex-triggered capture (original logic)
+          // ----------------------------------------------------------------
+          const toCapture = texts.filter((text) => text && shouldCapture(text) && !isNoise(text));
+          if (toCapture.length === 0) {
+            if (texts.length > 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: regex fallback diagnostics for agent ${agentId}: ${texts.map((text, idx) => `#${idx + 1}(${summarizeCaptureDecision(text)})`).join(" | ")}`,
+              );
+            }
+            api.logger.info(
+              `memory-lancedb-pro: regex fallback found 0 capturable texts for agent ${agentId}`,
+            );
+            return;
+          }
+
+          api.logger.info(
+            `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
+          );
 
           // Store each capturable piece (limit to 3 per conversation)
           let stored = 0;
@@ -1675,6 +2309,21 @@ const memoryLanceDBProPlugin = {
               importance: 0.7,
               category,
               scope: defaultScope,
+              metadata: stringifySmartMetadata(
+                buildSmartMetadata(
+                  {
+                    text,
+                    category,
+                    importance: 0.7,
+                  },
+                  {
+                    l0_abstract: text,
+                    l1_overview: `- ${text}`,
+                    l2_content: text,
+                    source_session: (event as any).sessionKey || "unknown",
+                  },
+                ),
+              ),
             });
             stored++;
 
@@ -2121,7 +2770,7 @@ const memoryLanceDBProPlugin = {
             command: String(event.action || "unknown"),
           });
 
-          const mappedReflectionMemories = extractReflectionMappedMemoryItems(reflectionText);
+          const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
           for (const mapped of mappedReflectionMemories) {
             const vector = await embedder.embedPassage(mapped.text);
             let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
@@ -2226,7 +2875,121 @@ const memoryLanceDBProPlugin = {
     }
 
     if (config.sessionStrategy === "systemSessionMemory") {
-      api.logger.info("session-strategy: using systemSessionMemory (plugin memory-reflection hooks disabled)");
+      const sessionMessageCount = config.sessionMemory?.messageCount ?? 15;
+
+      api.registerHook("command:new", async (event) => {
+        try {
+          api.logger.debug("session-memory: hook triggered for /new command");
+
+          const context = (event.context || {}) as Record<string, unknown>;
+          const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
+          const agentId = resolveHookAgentId(
+            (event.agentId as string) || (context.agentId as string) || undefined,
+            sessionKey || (context.sessionKey as string) || undefined,
+          );
+          const defaultScope = scopeManager.getDefaultScope(agentId);
+          const workspaceDir = resolveWorkspaceDirFromContext(context);
+          const cfg = context.cfg;
+          const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
+          const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
+          let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
+          const source = typeof context.commandSource === "string" ? context.commandSource : "unknown";
+
+          if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
+            const searchDirs = resolveReflectionSessionSearchDirs({
+              context,
+              cfg,
+              workspaceDir,
+              currentSessionFile,
+              sourceAgentId: agentId,
+            });
+
+            for (const sessionsDir of searchDirs) {
+              const recovered = await findPreviousSessionFile(
+                sessionsDir,
+                currentSessionFile,
+                currentSessionId,
+              );
+              if (recovered) {
+                currentSessionFile = recovered;
+                api.logger.debug(`session-memory: recovered session file: ${recovered}`);
+                break;
+              }
+            }
+          }
+
+          if (!currentSessionFile) {
+            api.logger.debug("session-memory: no session file found, skipping");
+            return;
+          }
+
+          const sessionContent = await readSessionConversationWithResetFallback(
+            currentSessionFile,
+            sessionMessageCount,
+          );
+          if (!sessionContent) {
+            api.logger.debug("session-memory: no session content found, skipping");
+            return;
+          }
+
+          const now = new Date(typeof event.timestamp === "number" ? event.timestamp : Date.now());
+          const dateStr = now.toISOString().split("T")[0];
+          const timeStr = now.toISOString().split("T")[1].split(".")[0];
+          const memoryText = [
+            `Session: ${dateStr} ${timeStr} UTC`,
+            `Session Key: ${sessionKey}`,
+            `Session ID: ${currentSessionId}`,
+            `Source: ${source}`,
+            "",
+            "Conversation Summary:",
+            sessionContent,
+          ].join("\n");
+
+          const vector = await embedder.embedPassage(memoryText);
+          await store.store({
+            text: memoryText,
+            vector,
+            category: "fact",
+            scope: defaultScope,
+            importance: 0.5,
+            metadata: stringifySmartMetadata(
+              buildSmartMetadata(
+                {
+                  text: `Session summary for ${dateStr}`,
+                  category: "fact",
+                  importance: 0.5,
+                  timestamp: Date.now(),
+                },
+                {
+                  l0_abstract: `Session summary for ${dateStr}`,
+                  l1_overview: `- Session summary saved for ${currentSessionId}`,
+                  l2_content: memoryText,
+                  memory_category: "patterns",
+                  tier: "peripheral",
+                  confidence: 0.5,
+                  type: "session-summary",
+                  sessionKey,
+                  sessionId: currentSessionId,
+                  date: dateStr,
+                  agentId,
+                  scope: defaultScope,
+                },
+              ),
+            ),
+          });
+
+          api.logger.info(
+            `session-memory: stored session summary for ${currentSessionId} (agent: ${agentId}, scope: ${defaultScope})`
+          );
+        } catch (err) {
+          api.logger.warn(`session-memory: failed to save: ${String(err)}`);
+        }
+      }, {
+        name: "memory-lancedb-pro-session-memory",
+        description: "Store /new session summaries in LanceDB memory",
+      });
+
+      api.logger.info("session-memory: hook registered for command:new as memory-lancedb-pro-session-memory");
     }
     if (config.sessionStrategy === "none") {
       api.logger.info("session-strategy: using none (plugin memory-reflection hooks disabled)");
@@ -2273,7 +3036,7 @@ const memoryLanceDBProPlugin = {
         if (files.length > 7) {
           const { unlink } = await import("node:fs/promises");
           for (const old of files.slice(0, files.length - 7)) {
-            await unlink(join(backupDir, old)).catch(() => {});
+            await unlink(join(backupDir, old)).catch(() => { });
           }
         }
 
@@ -2331,10 +3094,10 @@ const memoryLanceDBProPlugin = {
 
             api.logger.info(
               `memory-lancedb-pro: initialized successfully ` +
-                `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
-                `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
-                `mode: ${retrievalTest.mode}, ` +
-                `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
+              `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
+              `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
+              `mode: ${retrievalTest.mode}, ` +
+              `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
             );
 
             if (!embedTest.success) {
@@ -2357,19 +3120,27 @@ const memoryLanceDBProPlugin = {
         // Fire-and-forget: allow gateway to start serving immediately.
         setTimeout(() => void runStartupChecks(), 0);
 
+        // Check for legacy memories that could be upgraded
+        setTimeout(async () => {
+          try {
+            const upgrader = createMemoryUpgrader(store, null);
+            const counts = await upgrader.countLegacy();
+            if (counts.legacy > 0) {
+              api.logger.info(
+                `memory-lancedb-pro: found ${counts.legacy} legacy memories (of ${counts.total} total) that can be upgraded to the new smart memory format. ` +
+                `Run 'openclaw memory-pro upgrade' to convert them.`
+              );
+            }
+          } catch {
+            // Non-critical: silently ignore
+          }
+        }, 5_000);
+
         // Run initial backup after a short delay, then schedule daily
         setTimeout(() => void runBackup(), 60_000); // 1 min after start
         backupTimer = setInterval(() => void runBackup(), BACKUP_INTERVAL_MS);
       },
       stop: async () => {
-        // Flush pending access reinforcement data before shutdown
-        try {
-          await accessTracker.flush();
-        } catch (err) {
-          api.logger.warn("memory-lancedb-pro: flush failed on stop:", err);
-        }
-        accessTracker.destroy();
-
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
@@ -2432,9 +3203,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       ? sessionStrategyRaw
       : legacySessionMemoryEnabled === true
         ? "systemSessionMemory"
-      : legacySessionMemoryEnabled === false
-          ? "none"
-      : "systemSessionMemory";
+        : "none";
   const reflectionMessageCount = parsePositiveInt(memoryReflectionRaw?.messageCount ?? sessionMemoryRaw?.messageCount) ?? DEFAULT_REFLECTION_MESSAGE_COUNT;
   const injectModeRaw = memoryReflectionRaw?.injectMode;
   const reflectionInjectMode: ReflectionInjectMode =
@@ -2484,14 +3253,15 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
     captureAssistant: cfg.captureAssistant === true,
-    retrieval:
-      typeof cfg.retrieval === "object" && cfg.retrieval !== null
-        ? (cfg.retrieval as any)
-        : undefined,
-    scopes:
-      typeof cfg.scopes === "object" && cfg.scopes !== null
-        ? (cfg.scopes as any)
-        : undefined,
+    retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
+    decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
+    tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier as any : undefined,
+    // Smart extraction config (Phase 1)
+    smartExtraction: cfg.smartExtraction !== false, // Default ON
+    llm: typeof cfg.llm === "object" && cfg.llm !== null ? cfg.llm as any : undefined,
+    extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 2,
+    extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
+    scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,
     sessionStrategy,
     selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
@@ -2502,10 +3272,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         ensureLearningFiles: (cfg.selfImprovement as Record<string, unknown>).ensureLearningFiles !== false,
       }
       : {
-        enabled: true,
-        beforeResetNote: true,
-        skipSubagentBootstrap: true,
-        ensureLearningFiles: true,
+        enabled: false,
+        beforeResetNote: false,
+        skipSubagentBootstrap: false,
+        ensureLearningFiles: false,
       },
     memoryReflection: memoryReflectionRaw
       ? {
@@ -2541,26 +3311,26 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
         ? {
-            enabled:
-              (cfg.sessionMemory as Record<string, unknown>).enabled !== false,
-            messageCount:
-              typeof (cfg.sessionMemory as Record<string, unknown>)
-                .messageCount === "number"
-                ? ((cfg.sessionMemory as Record<string, unknown>)
-                    .messageCount as number)
-                : undefined,
-          }
+          enabled:
+            (cfg.sessionMemory as Record<string, unknown>).enabled === true,
+          messageCount:
+            typeof (cfg.sessionMemory as Record<string, unknown>)
+              .messageCount === "number"
+              ? ((cfg.sessionMemory as Record<string, unknown>)
+                .messageCount as number)
+              : undefined,
+        }
         : undefined,
     mdMirror:
       typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
         ? {
-            enabled:
-              (cfg.mdMirror as Record<string, unknown>).enabled === true,
-            dir:
-              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
-                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
-                : undefined,
-          }
+          enabled:
+            (cfg.mdMirror as Record<string, unknown>).enabled === true,
+          dir:
+            typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
+              ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
+              : undefined,
+        }
         : undefined,
   };
 }

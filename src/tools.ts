@@ -4,7 +4,6 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { stringEnum } from "openclaw/plugin-sdk";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -14,6 +13,14 @@ import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
 import type { MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
+import {
+  appendRelation,
+  buildSmartMetadata,
+  deriveFactKey,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+} from "./smart-metadata.js";
+import { TEMPORAL_VERSIONED_CATEGORIES } from "./memory-categories.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
 import { getDisplayCategoryTag } from "./reflection-metadata.js";
 
@@ -30,6 +37,12 @@ export const MEMORY_CATEGORIES = [
   "other",
 ] as const;
 
+function stringEnum<T extends readonly [string, ...string[]]>(values: T) {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: [...values],
+  });
+}
 export type MdMirrorWriter = (
   entry: { text: string; category: string; scope: string; timestamp?: number },
   meta?: { source?: string; agentId?: string },
@@ -76,6 +89,54 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     score: r.score,
     sources: r.sources,
   }));
+}
+
+function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const m = /^agent:([^:]+):/.exec(sessionKey);
+  return m?.[1];
+}
+
+function resolveRuntimeAgentId(
+  staticAgentId: string | undefined,
+  runtimeCtx: unknown,
+): string | undefined {
+  if (!runtimeCtx || typeof runtimeCtx !== "object") return staticAgentId;
+  const ctx = runtimeCtx as Record<string, unknown>;
+  const ctxAgentId = typeof ctx.agentId === "string" ? ctx.agentId : undefined;
+  const ctxSessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : undefined;
+  return ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
+}
+
+function resolveToolContext(
+  base: ToolContext,
+  runtimeCtx: unknown,
+): ToolContext {
+  return {
+    ...base,
+    agentId: resolveRuntimeAgentId(base.agentId, runtimeCtx),
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function retrieveWithRetry(
+  retriever: MemoryRetriever,
+  params: {
+    query: string;
+    limit: number;
+    scopeFilter?: string[];
+    category?: string;
+  },
+): Promise<RetrievalResult[]> {
+  let results = await retriever.retrieve(params);
+  if (results.length === 0) {
+    await sleep(75);
+    results = await retriever.retrieve(params);
+  }
+  return results;
 }
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
@@ -335,9 +396,9 @@ export function registerMemoryRecallTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
-        name: "memory_recall",
+      name: "memory_recall",
       label: "Memory Recall",
       description:
         "Search through long-term memories using hybrid retrieval (vector + keyword search). Use when you need context about user preferences, past decisions, or previously discussed topics.",
@@ -372,11 +433,12 @@ export function registerMemoryRecallTool(
 
         try {
           const safeLimit = clampInt(limit, 1, 20);
+          const agentId = runtimeContext.agentId;
 
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
+            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
@@ -391,7 +453,7 @@ export function registerMemoryRecallTool(
             }
           }
 
-          const results = await context.retriever.retrieve({
+          const results = await retrieveWithRetry(runtimeContext.retriever, {
             query,
             limit: safeLimit,
             scopeFilter,
@@ -406,15 +468,25 @@ export function registerMemoryRecallTool(
             };
           }
 
+          const now = Date.now();
+          await Promise.allSettled(
+            results.map((result) => {
+              const meta = parseSmartMetadata(result.entry.metadata, result.entry);
+              return runtimeContext.store.patchMetadata(
+                result.entry.id,
+                {
+                  access_count: meta.access_count + 1,
+                  last_accessed_at: now,
+                },
+                scopeFilter,
+              );
+            }),
+          );
+
           const text = results
             .map((r, i) => {
-              const sources = [];
-              if (r.sources.vector) sources.push("vector");
-              if (r.sources.bm25) sources.push("BM25");
-              if (r.sources.reranked) sources.push("reranked");
-
               const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
             })
             .join("\n");
 
@@ -430,7 +502,7 @@ export function registerMemoryRecallTool(
               memories: sanitizeMemoryForSerialization(results),
               query,
               scopes: scopeFilter,
-              retrievalMode: context.retriever.getConfig().mode,
+              retrievalMode: runtimeContext.retriever.getConfig().mode,
             },
           };
         } catch (error) {
@@ -457,9 +529,9 @@ export function registerMemoryStoreTool(
 ) {
   api.registerTool(
     (toolCtx) => {
-      const agentId = resolveAgentId((toolCtx as any)?.agentId, context.agentId) ?? "main";
+      const runtimeContext = resolveToolContext(context, toolCtx);
       return {
-        name: "memory_store",
+      name: "memory_store",
       label: "Memory Store",
       description:
         "Save important information in long-term memory. Use for preferences, facts, decisions, and other notable information.",
@@ -489,11 +561,12 @@ export function registerMemoryStoreTool(
         };
 
         try {
+          const agentId = runtimeContext.agentId;
           // Determine target scope
-          let targetScope = scope || context.scopeManager.getDefaultScope(agentId);
+          let targetScope = scope || runtimeContext.scopeManager.getDefaultScope(agentId);
 
           // Validate scope access
-          if (!context.scopeManager.isAccessible(targetScope, agentId)) {
+          if (!runtimeContext.scopeManager.isAccessible(targetScope, agentId)) {
             return {
               content: [
                 {
@@ -522,15 +595,16 @@ export function registerMemoryStoreTool(
           }
 
           const safeImportance = clamp01(importance, 0.7);
-          const vector = await context.embedder.embedPassage(text);
+          const vector = await runtimeContext.embedder.embedPassage(text);
 
           // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
           // Fail-open by design: dedup must never block a legitimate memory write.
-          let existing: Awaited<ReturnType<typeof context.store.vectorSearch>> = [];
+          // excludeInactive: superseded historical records must not block new writes.
+          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
           try {
-            existing = await context.store.vectorSearch(vector, 1, 0.1, [
+            existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
               targetScope,
-            ]);
+            ], { excludeInactive: true });
           } catch (err) {
             console.warn(
               `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
@@ -555,12 +629,26 @@ export function registerMemoryStoreTool(
             };
           }
 
-          const entry = await context.store.store({
+          const entry = await runtimeContext.store.store({
             text,
             vector,
             importance: safeImportance,
             category: category as any,
             scope: targetScope,
+            metadata: stringifySmartMetadata(
+              buildSmartMetadata(
+                {
+                  text,
+                  category: category as any,
+                  importance: safeImportance,
+                },
+                {
+                  l0_abstract: text,
+                  l1_overview: `- ${text}`,
+                  l2_content: text,
+                },
+              ),
+            ),
           });
 
           // Dual-write to Markdown mirror if enabled
@@ -629,7 +717,7 @@ export function registerMemoryForgetTool(
           }),
         ),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const { query, memoryId, scope } = params as {
           query?: string;
           memoryId?: string;
@@ -637,6 +725,7 @@ export function registerMemoryForgetTool(
         };
 
         try {
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
@@ -678,7 +767,7 @@ export function registerMemoryForgetTool(
           }
 
           if (query) {
-            const results = await context.retriever.retrieve({
+            const results = await retrieveWithRetry(context.retriever, {
               query,
               limit: 5,
               scopeFilter,
@@ -774,7 +863,7 @@ export function registerMemoryUpdateTool(
         name: "memory_update",
       label: "Memory Update",
       description:
-        "Update an existing memory in-place. Preserves original timestamp. Use when correcting outdated info or adjusting importance/category without losing creation date.",
+        "Update an existing memory. For preferences/entities, changing text creates a new version (supersede) to preserve history. Metadata-only changes (importance, category) update in-place.",
       parameters: Type.Object({
         memoryId: Type.String({
           description:
@@ -790,7 +879,7 @@ export function registerMemoryUpdateTool(
         ),
         category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const { memoryId, text, importance, category } = params as {
           memoryId: string;
           text?: string;
@@ -812,6 +901,7 @@ export function registerMemoryUpdateTool(
           }
 
           // Determine accessible scopes
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           const scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
@@ -819,7 +909,7 @@ export function registerMemoryUpdateTool(
           const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
           if (!uuidLike) {
             // Treat as search query
-            const results = await context.retriever.retrieve({
+            const results = await retrieveWithRetry(context.retriever, {
               query: memoryId,
               limit: 3,
               scopeFilter,
@@ -875,6 +965,93 @@ export function registerMemoryUpdateTool(
             }
             newVector = await context.embedder.embedPassage(text);
           }
+
+          // --- Temporal supersede guard ---
+          // For temporal-versioned categories (preferences/entities), changing
+          // text must go through supersede to preserve the history chain.
+          if (text && newVector) {
+            const existing = await context.store.getById(resolvedId, scopeFilter);
+            if (existing) {
+              const meta = parseSmartMetadata(existing.metadata, existing);
+              if (TEMPORAL_VERSIONED_CATEGORIES.has(meta.memory_category)) {
+                const now = Date.now();
+                const factKey =
+                  meta.fact_key ?? deriveFactKey(meta.memory_category, text);
+
+                // Create new superseding record
+                const newMeta = buildSmartMetadata(
+                  { text, category: existing.category },
+                  {
+                    l0_abstract: text,
+                    l1_overview: meta.l1_overview,
+                    l2_content: text,
+                    memory_category: meta.memory_category,
+                    tier: meta.tier,
+                    access_count: 0,
+                    confidence: importance !== undefined ? clamp01(importance, 0.7) : meta.confidence,
+                    valid_from: now,
+                    fact_key: factKey,
+                    supersedes: resolvedId,
+                    relations: appendRelation([], {
+                      type: "supersedes",
+                      targetId: resolvedId,
+                    }),
+                  },
+                );
+
+                const newEntry = await context.store.store({
+                  text,
+                  vector: newVector,
+                  category: category ? (category as any) : existing.category,
+                  scope: existing.scope,
+                  importance:
+                    importance !== undefined
+                      ? clamp01(importance, 0.7)
+                      : existing.importance,
+                  metadata: stringifySmartMetadata(newMeta),
+                });
+
+                // Invalidate old record (metadata-only patch — safe)
+                try {
+                  const invalidatedMeta = buildSmartMetadata(existing, {
+                    fact_key: factKey,
+                    invalidated_at: now,
+                    superseded_by: newEntry.id,
+                    relations: appendRelation(meta.relations, {
+                      type: "superseded_by",
+                      targetId: newEntry.id,
+                    }),
+                  });
+                  await context.store.update(
+                    resolvedId,
+                    { metadata: stringifySmartMetadata(invalidatedMeta) },
+                    scopeFilter,
+                  );
+                } catch (patchErr) {
+                  // New record is already the source of truth; log but don't fail
+                  console.warn(
+                    `memory-pro: failed to patch superseded record ${resolvedId.slice(0, 8)}: ${patchErr}`,
+                  );
+                }
+
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Superseded memory ${resolvedId.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                    },
+                  ],
+                  details: {
+                    action: "superseded",
+                    oldId: resolvedId,
+                    newId: newEntry.id,
+                    category: meta.memory_category,
+                  },
+                };
+              }
+            }
+          }
+          // --- End temporal supersede guard ---
 
           const updates: Record<string, any> = {};
           if (text) updates.text = text;
@@ -957,10 +1134,11 @@ export function registerMemoryStatsTool(
           }),
         ),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const { scope } = params as { scope?: string };
 
         try {
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
           if (scope) {
@@ -1059,7 +1237,7 @@ export function registerMemoryListTool(
           }),
         ),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const {
           limit = 10,
           scope,
@@ -1075,6 +1253,7 @@ export function registerMemoryListTool(
         try {
           const safeLimit = clampInt(limit, 1, 50);
           const safeOffset = clampInt(offset, 0, 1000);
+          const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
 
           // Determine accessible scopes
           let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);

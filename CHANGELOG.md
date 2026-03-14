@@ -1,31 +1,27 @@
 # Changelog
 
-## 1.1.0
+## 1.1.0-beta.2 (Smart Memory Beta + Access Reinforcement)
 
-- Feat: add integrated self-improvement governance flow (`agent:bootstrap`, `command:new/reset`, governance tools, and `.learnings` file bootstrap).
-- Feat: add `memoryReflection` session strategy with inheritance/derived injection, reflection persistence, and dedicated reflection-agent support.
-- Fix: keep session-strategy compatibility by mapping legacy `sessionMemory.enabled` to `systemSessionMemory` / `none` and trimming reflection input toward recent conversation tail.
-- Fix: retry early transient upstream reflection failures once and broaden session recovery search paths to real OpenClaw agent session directories.
-- Docs: update README / README_CN for session strategy, self-improvement, memoryReflection, mdMirror, and reflection fallback behavior.
-- Tests: add targeted coverage for reflection retry classification and session recovery path resolution.
+This is a **beta** release published under the npm dist-tag **`beta`** (it does not affect the stable `latest` channel).
 
-PRs: #43, #2
+Highlights:
+- **Smart Extraction (LLM-powered)**: 6-category extraction with L0/L1/L2 metadata (falls back to regex capture when disabled or init fails)
+- **Lifecycle scoring integrated into retrieval**: decay-based score adjustment + tier floors
+- **Tier transitions (best-effort)**: bounded metadata write-backs for top results (tier / access stats)
+- **Access reinforcement for time decay**: frequently *manually recalled* memories decay more slowly (spaced-repetition style)
+  - Adds `AccessTracker` with debounced metadata write-back (accessCount / lastAccessedAt)
+  - Adds retrieval config: `reinforcementFactor` (default: 0.5) and `maxHalfLifeMultiplier` (default: 3)
 
----
-
-## 1.0.32
-
-- Fix: strip OpenClaw `Conversation info` / `Sender` metadata noise before auto-capture matching and adaptive retrieval normalization, reducing false captures and noisy retrieval triggers.
-- Fix: parse `autoRecallMinRepeated` from plugin config so repeated-memory suppression works when configured.
-
-PR: #50
+Notes:
+- Access reinforcement is gated to manual recall (`source: \"manual\"`) to avoid auto-recall strengthening noise.
 
 ---
 
+## 1.1.0-beta.1 (Smart Memory Beta)
 
-## 1.0.31
+- Initial beta with Smart Extraction + lifecycle components (decay engine + tier manager)
 
-- Fix: `memory-pro import` now preserves provided IDs and is idempotent (skips if ID already exists).
+---
 
 ## 1.0.26
 
