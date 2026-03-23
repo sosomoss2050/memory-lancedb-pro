@@ -56,13 +56,44 @@ function createMockApi(pluginConfig, options = {}) {
   };
 }
 
-for (const key of ["smartExtraction", "extractMinMessages", "extractMaxChars"]) {
+for (const key of [
+  "smartExtraction",
+  "extractMinMessages",
+  "extractMaxChars",
+  "llm",
+  "autoRecallMaxItems",
+  "autoRecallMaxChars",
+  "autoRecallPerItemMaxChars",
+]) {
   assert.ok(
     Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, key),
     `configSchema should declare ${key}`,
   );
 }
 
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "auth"),
+  "configSchema should declare llm.auth",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthPath"),
+  "configSchema should declare llm.oauthPath",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
+  "configSchema should declare llm.oauthProvider",
+);
+
+assert.equal(
+  manifest.configSchema.properties.autoRecallMinRepeated.default,
+  8,
+  "autoRecallMinRepeated schema default should be conservative",
+);
+assert.equal(
+  manifest.configSchema.properties.extractMinMessages.default,
+  4,
+  "extractMinMessages schema default should reduce aggressive auto-capture",
+);
 assert.equal(
   manifest.configSchema.properties.autoCapture.default,
   true,
@@ -77,6 +108,10 @@ assert.equal(
   manifest.configSchema.properties.sessionMemory.properties.enabled.default,
   false,
   "sessionMemory.enabled schema default should match runtime default",
+);
+assert.ok(
+  manifest.configSchema.properties.retrieval.properties.rerankProvider.enum.includes("tei"),
+  "rerankProvider schema should include tei",
 );
 
 assert.equal(
