@@ -212,17 +212,6 @@ export class MemoryStore {
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
     const lockfile = await loadLockfile();
     const lockPath = join(this.config.dbPath, ".memory-write.lock");
-    if (!existsSync(lockPath)) {
-      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
-      try { const { writeFileSync } = await import("node:fs"); writeFileSync(lockPath, "", { flag: "wx" }); } catch {}
-    }
-    // 【修復 #415】調整 retries：max wait 從 ~3100ms → ~151秒
-    // 指數退避：1s, 2s, 4s, 8s, 16s, 30s×5，總計約 151 秒
-    // ECOMPROMISED 透過 onCompromised callback 觸發（非 throw），使用 flag 機制正確處理
-    let isCompromised = false;
-    let compromisedErr: unknown = null;
-    let fnSucceeded = false;
-    let fnError: unknown = null;
 
     // Proactive cleanup of stale lock artifacts（from PR #626）
     // 根本避免 >5 分鐘的 lock artifact 導致 ECOMPROMISED
@@ -236,6 +225,24 @@ export class MemoryStore {
           console.warn(`[memory-lancedb-pro] cleared stale lock: ${lockPath} ageMs=${ageMs}`);
         }
       } catch {}
+    }
+
+    // Ensure lock file exists for proper-lockfile's realpath check
+    // Fix: must create BEFORE lockfile.lock() which calls realpath internally
+    if (!existsSync(lockPath)) {
+      try { mkdirSync(dirname(lockPath), { recursive: true }); } catch {}
+      try {
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(lockPath, "", { flag: "wx" });
+      } catch {
+        // wx failed (e.g. race condition), try non-exclusive creation
+        if (!existsSync(lockPath)) {
+          try {
+            const { writeFileSync } = await import("node:fs");
+            writeFileSync(lockPath, "", { flag: "w" });
+          } catch {}
+        }
+      }
     }
 
     const release = await lockfile.lock(lockPath, {
