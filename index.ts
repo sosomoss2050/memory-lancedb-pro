@@ -1914,6 +1914,24 @@ const memoryLanceDBProPlugin = {
   description:
     "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, and management CLI",
   kind: "memory" as const,
+  contracts: {
+    tools: [
+      "memory_recall",
+      "memory_store",
+      "memory_forget",
+      "memory_update",
+      "memory_stats",
+      "memory_debug",
+      "memory_list",
+      "memory_promote",
+      "memory_archive",
+      "memory_compact",
+      "memory_explain_rank",
+      "self_improvement_log",
+      "self_improvement_extract_skill",
+      "self_improvement_review",
+    ],
+  },
 
   register(api: OpenClawPluginApi) {
     // Idempotent guard: skip re-init if this exact API instance has already registered.
@@ -3945,12 +3963,12 @@ const memoryLanceDBProPlugin = {
             // Test components (bounded time)
             const embedTest = await withTimeout(
               embedder.test(),
-              8_000,
+              15_000,
               "embedder.test()",
             );
             const retrievalTest = await withTimeout(
               retriever.test(),
-              8_000,
+              15_000,
               "retriever.test()",
             );
 
