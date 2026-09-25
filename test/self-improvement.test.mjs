@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,8 +17,13 @@ const jiti = jitiFactory(import.meta.url, {
 const {
   registerSelfImprovementLogTool,
   registerSelfImprovementExtractSkillTool,
+  registerSelfImprovementReviewTool,
 } = jiti("../src/tools.ts");
-const { appendSelfImprovementEntry } = jiti("../src/self-improvement-files.ts");
+const {
+  appendSelfImprovementEntry,
+  countSelfImprovementEntries,
+  ensureSelfImprovementLearningFiles,
+} = jiti("../src/self-improvement-files.ts");
 const {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemories,
@@ -26,7 +31,7 @@ const {
   extractReflectionMappedMemories,
 } = jiti("../src/reflection-slices.ts");
 
-function createToolHarness(workspaceDir) {
+function createToolHarness(workspaceDir, overrides = {}) {
   const factories = new Map();
   const api = {
     registerTool(factory, meta) {
@@ -41,10 +46,12 @@ function createToolHarness(workspaceDir) {
     scopeManager: {},
     embedder: {},
     mdMirror: null,
+    ...overrides,
   };
 
   registerSelfImprovementLogTool(api, context);
   registerSelfImprovementExtractSkillTool(api, context);
+  registerSelfImprovementReviewTool(api, context);
 
   return {
     tool(name, toolCtx = {}) {
@@ -65,6 +72,25 @@ describe("self-improvement", () => {
 
     afterEach(() => {
       rmSync(workspaceDir, { recursive: true, force: true });
+    });
+
+    it("ensures learning files idempotently under concurrent calls", async () => {
+      const learningsDir = path.join(workspaceDir, ".learnings");
+      mkdirSync(learningsDir, { recursive: true });
+      writeFileSync(path.join(learningsDir, "LEARNINGS.md"), "# Custom Learnings\n", "utf-8");
+      writeFileSync(path.join(learningsDir, "ERRORS.md"), "\n", "utf-8");
+
+      await Promise.all([
+        ensureSelfImprovementLearningFiles(workspaceDir),
+        ensureSelfImprovementLearningFiles(workspaceDir),
+        ensureSelfImprovementLearningFiles(workspaceDir),
+      ]);
+
+      const learningsBody = readFileSync(path.join(learningsDir, "LEARNINGS.md"), "utf-8");
+      const errorsBody = readFileSync(path.join(learningsDir, "ERRORS.md"), "utf-8");
+      assert.equal(learningsBody, "# Custom Learnings\n");
+      assert.match(errorsBody, /^# Errors/);
+      assert.match(errorsBody, /ERR-YYYYMMDD-XXX/);
     });
 
     it("extracts mapped reflection sections into preference/fact/decision memories", async () => {
@@ -228,6 +254,61 @@ describe("self-improvement", () => {
       assert.match(learningsBody, /Document the triage-first rule after it repeats/);
       assert.match(learningsBody, /\*\*Status\*\*: pending/);
       assert.match(learningsBody, /Source: memory-lancedb-pro\/reflection:test/);
+    });
+
+    it("skips new entries when the configured per-file limit is reached", async () => {
+      const first = await appendSelfImprovementEntry({
+        baseDir: workspaceDir,
+        type: "learning",
+        summary: "Keep the active backlog bounded.",
+        maxEntries: 1,
+      });
+      const second = await appendSelfImprovementEntry({
+        baseDir: workspaceDir,
+        type: "learning",
+        summary: "This entry should not be appended.",
+        maxEntries: 1,
+      });
+
+      assert.equal(first.skipped, false);
+      assert.equal(first.entryCount, 1);
+      assert.equal(second.skipped, true);
+      assert.equal(second.entryCount, 1);
+      assert.equal(second.maxEntries, 1);
+
+      const learningsPath = path.join(workspaceDir, ".learnings", "LEARNINGS.md");
+      const learningsBody = readFileSync(learningsPath, "utf-8");
+      assert.equal(countSelfImprovementEntries(learningsBody), 1);
+      assert.match(learningsBody, /Keep the active backlog bounded/);
+      assert.doesNotMatch(learningsBody, /This entry should not be appended/);
+    });
+
+    it("surfaces the entry limit through log and review tools", async () => {
+      const harness = createToolHarness(workspaceDir, { selfImprovementMaxEntries: 1 });
+      const logTool = harness.tool("self_improvement_log");
+      const reviewTool = harness.tool("self_improvement_review");
+
+      const logged = await logTool.execute("tc-limit-1", {
+        type: "learning",
+        summary: "First entry fits under the limit.",
+      });
+      assert.equal(logged?.details?.action, "logged");
+      assert.equal(logged?.details?.entryCount, 1);
+      assert.equal(logged?.details?.maxEntries, 1);
+
+      const skipped = await logTool.execute("tc-limit-2", {
+        type: "learning",
+        summary: "Second entry should be blocked.",
+      });
+      assert.equal(skipped?.details?.action, "skipped_limit");
+      assert.equal(skipped?.details?.entryCount, 1);
+      assert.equal(skipped?.details?.maxEntries, 1);
+      assert.match(skipped?.content?.[0]?.text ?? "", /already has 1\/1 entries/);
+
+      const review = await reviewTool.execute("tc-limit-3", {});
+      assert.equal(review?.details?.stats?.files?.["LEARNINGS.md"]?.entries, 1);
+      assert.equal(review?.details?.stats?.files?.["LEARNINGS.md"]?.atLimit, true);
+      assert.match(review?.content?.[0]?.text ?? "", /LEARNINGS\.md: 1\/1/);
     });
 
     it("handles learning id validation and writes promoted skill scaffold with sanitized outputDir", async () => {

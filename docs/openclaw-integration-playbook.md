@@ -56,6 +56,20 @@ If both are enabled, `/new` can produce two outputs:
 
 That is valid, but it is a double-write design. If you do not want duplicated session summarization paths, keep only one.
 
+### Mode C: Retrieval + OpenClaw memory runtime and dreaming
+
+Use this when `memory-lancedb-pro` owns `plugins.slots.memory` and OpenClaw should treat the plugin as the active memory capability.
+
+In this mode:
+
+- the plugin registers `runtime`, `promptBuilder`, `flushPlanResolver`, and `publicArtifacts` through `api.registerMemoryCapability`
+- `canonicalCorpus.enabled` indexes `MEMORY.md`, `memory/**/*.md`, recent session JSONL transcripts, and `memory/dreaming/**/*.md` into LanceDB
+- the files remain the source of truth; LanceDB is the semantic index for grounded search
+- runtime search results must include `path`, `startLine`, `endLine`, `snippet`, `source`, and `citation`
+- dream reports are exposed as `dream-report` public artifacts, and `memory/.dreams/events.jsonl` is exposed as the dreaming event log
+
+If `dreaming.enabled` is true, OpenClaw may load the built-in memory-core dreaming sidecar while keeping `memory-lancedb-pro` as the selected memory slot owner. Keep the dreaming config under the `memory-lancedb-pro` plugin entry so OpenClaw resolves the sidecar against the active memory plugin.
+
 ## 2. Recommended Session Memory Strategy
 
 For most users, use one of these patterns.
@@ -117,8 +131,11 @@ Confirm:
 
 - plugin is loaded from the expected path
 - `plugins.slots.memory` points to `memory-lancedb-pro`
+- the plugin registers a memory capability, not only legacy hooks/tools
 - the expected hooks are enabled
 - the gateway has been restarted after config changes
+- for multi-agent or multi-process write tests, the deployment matches the
+  [lock-management requirements](lock-management.md)
 
 If you use plugin session memory, `openclaw hooks list --json` should show the plugin hook:
 
@@ -211,6 +228,57 @@ Validate at least once:
 - `memory_list`
 - `memory_stats`
 
+### OpenClaw memory runtime loop
+
+When `canonicalCorpus.enabled` is true, create a temporary markdown note under `memory/YYYY-MM-DD.md` and verify runtime memory search can return it with:
+
+- `source: "memory"`
+- a real workspace-relative path, not only a `memory-lancedb-pro/<id>.md` virtual path
+- line numbers and a snippet that match the file
+
+For session transcript coverage, verify a recent `~/.openclaw/agents/<agentId>/sessions/*.jsonl` entry can be returned with `source: "sessions"` when session transcript indexing is enabled.
+
+For dreaming coverage, verify that `memory/dreaming/*.md` appears as a `dream-report` public artifact and that `memory/.dreams/events.jsonl` appears as an `event-log` public artifact when present.
+
+### Public X/Twitter source capture
+
+Use this optional recipe when an OpenClaw agent gathers public X/Twitter context through TweetClaw and you want a reviewed source summary to become searchable memory.
+
+Allowed source actions:
+
+- search public tweets or replies
+- look up a public user profile
+- export public follower or media metadata when the workflow needs it
+- consume monitors or webhooks that report public tweet events
+
+Before calling `memory_store`, review the source result and keep only durable research context:
+
+- tweet URL
+- author handle
+- published timestamp
+- short text excerpt or human-written summary
+- relevant metrics, if needed for the research task
+- query or monitor that found the source
+- capture date
+
+Store the reviewed summary as `category: "fact"` for source evidence or `category: "decision"` when the team has made a decision from that evidence. Include the public source URL and capture date in the memory text or metadata so later recall can cite where the information came from.
+
+Never store secrets or private account material from this flow:
+
+- API keys, cookies, bearer tokens, or account credentials
+- direct-message content
+- draft post or reply text
+- non-public profile, follower, or media data
+
+Keep visible X/Twitter actions outside the memory plugin. Posting tweets, posting replies, sending direct messages, uploading media, and downloading media require explicit user approval in the tool workflow that performs the action. `memory-lancedb-pro` should only persist the reviewed summary after that workflow has produced safe public source context.
+
+Verification checklist:
+
+- the stored memory contains the public URL and capture date
+- the text is a summary or short excerpt, not a raw transcript dump
+- no credentials, cookies, direct messages, or draft text appear in the memory
+- any visible action on X/Twitter was approved outside the memory plugin
+
 ### Scope isolation
 
 Validate at least:
@@ -290,6 +358,14 @@ Run this matrix before release candidates or after major retrieval changes.
 - `/new` triggers the intended hook path
 - plugin-only mode does not rely on built-in session artifacts
 - dual-write mode is explicit and understood
+
+### Canonical corpus and dreaming
+
+- `MEMORY.md` and `memory/**/*.md` stay readable as files
+- LanceDB contains indexed corpus entries with `openclaw_corpus` metadata
+- session transcript indexing can be disabled independently with `canonicalCorpus.includeSessionTranscripts`
+- dreaming config validates under the `memory-lancedb-pro` plugin entry
+- public artifacts include dream reports and the dreaming event log when files exist
 
 ### Agent bootstrap
 

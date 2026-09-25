@@ -14,6 +14,7 @@ const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 // ────────────────────────────────────────────────────────────────────────────── Mock implementations ──────────────────────────────────────────────────────────────────────────────
 
 let storedRecords = [];
+let bulkStoreCalls = [];
 
 const mockEmbedder = {
   embedQuery: async (text) => {
@@ -38,14 +39,27 @@ const mockEmbedder = {
     }
     return vec;
   },
+  embedBatchPassage: async (texts) => Promise.all(texts.map((text) => mockEmbedder.embedPassage(text))),
 };
 
 const mockStore = {
   get storedRecords() {
     return storedRecords;
   },
+  get bulkStoreCalls() {
+    return bulkStoreCalls;
+  },
   async store(entry) {
     storedRecords.push({ ...entry });
+  },
+  async bulkStore(entries) {
+    bulkStoreCalls.push(entries.map((entry) => ({ ...entry })));
+    storedRecords.push(...entries.map((entry) => ({ ...entry })));
+    return entries.map((entry, index) => ({
+      ...entry,
+      id: `bulk-${bulkStoreCalls.length}-${index}`,
+      timestamp: Date.now(),
+    }));
   },
   async bm25Search(query, limit = 1, scopeFilter = []) {
     const q = query.toLowerCase();
@@ -59,6 +73,7 @@ const mockStore = {
   },
   reset() {
     storedRecords.length = 0; // Mutate in place to preserve the array reference
+    bulkStoreCalls.length = 0;
   },
 };
 
@@ -88,6 +103,18 @@ async function setupWorkspace(name) {
   const wsDir = join(testWorkspaceDir, "workspace", name);
   await mkdir(wsDir, { recursive: true });
   return wsDir;
+}
+
+async function captureConsoleLogs(run) {
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => logs.push(args.join(" "));
+  try {
+    const result = await run();
+    return { result, output: logs.join("\n") };
+  } finally {
+    console.log = originalLog;
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────── Setup / Teardown ──────────────────────────────────────────────────────────────────────────────
@@ -197,6 +224,66 @@ describe("import-markdown CLI", () => {
     });
   });
 
+  describe("process logging", () => {
+    it("prints default process logs and detailed summary counters", async () => {
+      const wsDir = await setupWorkspace("logging-summary-test");
+      await writeFile(
+        join(wsDir, "MEMORY.md"),
+        "- no\n- Duplicate log entry\n- Fresh visible import entry\n",
+        "utf-8",
+      );
+
+      mockStore.storedRecords.push({
+        text: "Duplicate log entry",
+        scope: "logging-summary-test",
+        category: "other",
+        importance: 0.7,
+        vector: [0.1],
+        metadata: "{}",
+      });
+
+      const { result, output } = await captureConsoleLogs(() =>
+        runImportMarkdown(
+          { embedder: mockEmbedder, store: mockStore },
+          {
+            openclawHome: testWorkspaceDir,
+            workspaceGlob: "logging-summary-test",
+            dedup: true,
+          },
+        ),
+      );
+
+      assert.strictEqual(result.foundFiles, 1);
+      assert.strictEqual(result.entriesProcessed, 3);
+      assert.strictEqual(result.imported, 1);
+      assert.strictEqual(result.skipped, 2);
+      assert.strictEqual(result.skippedShort, 1);
+      assert.strictEqual(result.skippedDedup, 1);
+      assert.strictEqual(result.errorCount, 0);
+      assert.strictEqual(result.embedBatches, 1);
+      assert.strictEqual(result.bulkStoreCalls, 1);
+
+      assert.match(output, /\[scan\] found 1 markdown file\(s\) across 1 workspace\(s\):/);
+      assert.match(output, /\[scan\] \[logging-summary-test\].*MEMORY\.md/);
+      assert.match(output, /\[scan\] reading: .*MEMORY\.md/);
+      assert.match(output, /\[import\] dedup check: enabled/);
+      assert.match(output, /\[skip\] too short \[logging-summary-test\]: no/);
+      assert.match(output, /\[skip\] dedup \[logging-summary-test\]: Duplicate log entry/);
+      assert.match(output, /\[import\] embedded batch 1 \(1 entries\)/);
+      assert.match(output, /\[import\] stored batch 1 \(1\/1 entries, total: 1\)/);
+      assert.match(output, /Memory Import Status:/);
+      assert.match(output, /• Files found: 1/);
+      assert.match(output, /• Entries processed: 3/);
+      assert.match(output, /• Imported: 1/);
+      assert.match(output, /• Skipped \(too short\): 1/);
+      assert.match(output, /• Skipped \(dedup\): 1/);
+      assert.match(output, /• Errors: 0/);
+      assert.match(output, /• Embed batches: 1/);
+      assert.match(output, /• bulkStore calls: 1/);
+      assert.match(output, /• Elapsed: \d+ms/);
+    });
+  });
+
   describe("dedup logic", () => {
     it("skips already-imported entries in same scope when dedup is enabled", async () => {
       const wsDir = await setupWorkspace("dedup-test");
@@ -249,6 +336,121 @@ describe("import-markdown CLI", () => {
 
       assert.strictEqual(imported, 1);
       assert.strictEqual(mockStore.storedRecords.length, 2); // Two entries, different scopes
+    });
+
+    it("skips an exact duplicate even when BM25 ranks it below a similar result", async () => {
+      const wsDir = await setupWorkspace("dedup-rank-test");
+      await writeFile(join(wsDir, "MEMORY.md"), "- Exact duplicate memory\n", "utf-8");
+
+      const rankedStore = {
+        ...mockStore,
+        async bm25Search(query, limit = 1, scopeFilter = []) {
+          assert.strictEqual(query, "Exact duplicate memory");
+          assert.deepStrictEqual(scopeFilter, ["dedup-rank-test"]);
+          return [
+            {
+              entry: {
+                text: "Similar but not exact duplicate memory",
+                scope: "dedup-rank-test",
+              },
+              score: 1.0,
+            },
+            {
+              entry: {
+                text: "Exact duplicate memory",
+                scope: "dedup-rank-test",
+              },
+              score: 0.95,
+            },
+          ].slice(0, limit);
+        },
+      };
+
+      const { imported, skipped } = await runImportMarkdown(
+        { embedder: mockEmbedder, store: rankedStore },
+        {
+          openclawHome: testWorkspaceDir,
+          workspaceGlob: "dedup-rank-test",
+          dedup: true,
+        },
+      );
+
+      assert.strictEqual(imported, 0);
+      assert.strictEqual(skipped, 1);
+      assert.strictEqual(mockStore.storedRecords.length, 0);
+    });
+
+    it("batch imports mixed valid, short, duplicate, and cross-scope bullets", async () => {
+      const isolatedHome = join(tmpdir(), "import-markdown-batch-dedup-test-" + Date.now());
+      const workspaceA = join(isolatedHome, "workspace", "workspace-a");
+      const workspaceB = join(isolatedHome, "workspace", "workspace-b");
+      await mkdir(workspaceA, { recursive: true });
+      await mkdir(workspaceB, { recursive: true });
+      await writeFile(
+        join(workspaceA, "MEMORY.md"),
+        "- Duplicate scoped memory\n- no\n- Fresh workspace A memory\n",
+        "utf-8",
+      );
+      await writeFile(
+        join(workspaceB, "MEMORY.md"),
+        "- Duplicate scoped memory\n- Fresh workspace B memory\n",
+        "utf-8",
+      );
+
+      mockStore.storedRecords.push({
+        text: "Duplicate scoped memory",
+        scope: "workspace-a",
+        category: "other",
+        importance: 0.7,
+        vector: [0.1],
+        metadata: "{}",
+      });
+
+      const batchEmbedder = {
+        batchInputs: [],
+        embedPassageCalls: 0,
+        embedQuery: mockEmbedder.embedQuery,
+        async embedPassage(text) {
+          this.embedPassageCalls++;
+          return mockEmbedder.embedPassage(text);
+        },
+        async embedBatchPassage(texts) {
+          this.batchInputs.push([...texts]);
+          return Promise.all(texts.map((text) => mockEmbedder.embedPassage(text)));
+        },
+      };
+
+      const { imported, skipped, foundFiles } = await runImportMarkdown(
+        { embedder: batchEmbedder, store: mockStore },
+        {
+          openclawHome: isolatedHome,
+          dedup: true,
+        },
+      );
+
+      assert.strictEqual(foundFiles, 2);
+      assert.strictEqual(imported, 3);
+      assert.strictEqual(skipped, 2);
+      assert.deepStrictEqual(batchEmbedder.batchInputs, [
+        ["Fresh workspace A memory"],
+        ["Duplicate scoped memory", "Fresh workspace B memory"],
+      ]);
+      assert.strictEqual(batchEmbedder.embedPassageCalls, 0);
+      assert.strictEqual(mockStore.bulkStoreCalls.length, 2);
+
+      const importedRecords = mockStore.storedRecords.slice(1);
+      assert.deepStrictEqual(
+        importedRecords.map((record) => [record.text, record.scope]),
+        [
+          ["Fresh workspace A memory", "workspace-a"],
+          ["Duplicate scoped memory", "workspace-b"],
+          ["Fresh workspace B memory", "workspace-b"],
+        ],
+      );
+      assert.deepStrictEqual(
+        importedRecords.map((record) => JSON.parse(record.metadata).sourceScope),
+        ["workspace-a", "workspace-b", "workspace-b"],
+      );
     });
   });
 

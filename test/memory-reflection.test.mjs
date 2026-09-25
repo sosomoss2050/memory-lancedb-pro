@@ -122,10 +122,10 @@ describe("memory reflection", () => {
 
       const conversation = await readSessionConversationWithResetFallback(sessionPath, 10);
       assert.ok(conversation);
-      assert.match(conversation, /user: Please keep responses concise and factual\./);
-      assert.match(conversation, /assistant: Acknowledged\. I will keep responses concise and factual\./);
+      assert.match(conversation, /<user_message>\nPlease keep responses concise and factual\.\n<\/user_message>/);
+      assert.match(conversation, /<assistant_message>\nAcknowledged\. I will keep responses concise and factual\.\n<\/assistant_message>/);
       assert.doesNotMatch(conversation, /old reset snapshot/);
-      assert.doesNotMatch(conversation, /^user:\s*\/new/m);
+      assert.doesNotMatch(conversation, /\/new/);
     });
   });
 
@@ -299,7 +299,7 @@ describe("memory reflection", () => {
       await assert.rejects(
         runWithReflectionTransientRetryOnce({
           scope: "reflection",
-          runner: "cli",
+          runner: "completion",
           retryState,
           execute: async () => {
             attempts += 1;
@@ -322,7 +322,7 @@ describe("memory reflection", () => {
       await assert.rejects(
         runWithReflectionTransientRetryOnce({
           scope: "distiller",
-          runner: "cli",
+          runner: "completion",
           retryState,
           execute: async () => {
             attempts += 1;
@@ -483,6 +483,147 @@ describe("memory reflection", () => {
       const meta = JSON.parse(storedEntries[0].metadata);
       assert.equal(meta.type, "memory-reflection-event");
       assert.equal(meta.usedFallback, true);
+    });
+
+    it("fires onPersisted for event and slice item rows, not for the legacy combined row", async () => {
+      const storedEntries = [];
+      const persisted = [];
+
+      const result = await storeReflectionToLanceDB({
+        reflectionText: [
+          "## Invariants",
+          "- Always confirm assumptions before changing files.",
+          "## Derived",
+          "- Next run verify reflection persistence with targeted tests.",
+        ].join("\n"),
+        sessionKey: "agent:main:session:mirror",
+        sessionId: "mirror",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [],
+        runAt: 1_700_500_000_000,
+        usedFallback: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => {
+          storedEntries.push(entry);
+          return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_500_000_000 };
+        },
+        onPersisted: async (entry, kind) => {
+          persisted.push({ entry, kind });
+        },
+      });
+
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant", "item-derived", "combined-legacy"]);
+      assert.equal(storedEntries.length, 4);
+
+      assert.deepEqual(persisted.map((p) => p.kind), ["event", "item-invariant", "item-derived"]);
+
+      const eventCall = persisted.find((p) => p.kind === "event");
+      assert.ok(eventCall);
+      assert.equal(eventCall.entry.category, "reflection");
+      assert.equal(eventCall.entry.scope, "global");
+      assert.equal(eventCall.entry.timestamp, 1_700_500_000_000);
+      assert.match(eventCall.entry.text, /^reflection-event/);
+      assert.ok(eventCall.entry.text.includes("\n"), "event text should be the raw multi-line key=value form at the mint site");
+
+      const invariantCall = persisted.find((p) => p.kind === "item-invariant");
+      assert.equal(invariantCall.entry.text, "Always confirm assumptions before changing files.");
+
+      const derivedCall = persisted.find((p) => p.kind === "item-derived");
+      assert.equal(derivedCall.entry.text, "Next run verify reflection persistence with targeted tests.");
+    });
+
+    it("does not fail storage when onPersisted is absent", async () => {
+      const storedEntries = [];
+      const result = await storeReflectionToLanceDB({
+        reflectionText: "## Invariants\n- Always run tests after edits.",
+        sessionKey: "agent:main:session:noop",
+        sessionId: "noop",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [],
+        runAt: 1_700_600_000_000,
+        usedFallback: false,
+        writeLegacyCombined: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => {
+          storedEntries.push(entry);
+          return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_600_000_000 };
+        },
+      });
+
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant"]);
+    });
+
+    it("does not abort remaining stores when onPersisted throws", async () => {
+      const storedEntries = [];
+      const persistedCalls = [];
+      const result = await storeReflectionToLanceDB({
+        reflectionText: [
+          "## Invariants",
+          "- Always run tests after edits.",
+          "## Derived",
+          "- Next run double-check the mirror callback contract.",
+        ].join("\n"),
+        sessionKey: "agent:main:session:throwing",
+        sessionId: "throwing",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [],
+        runAt: 1_700_800_000_000,
+        usedFallback: false,
+        writeLegacyCombined: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => {
+          storedEntries.push(entry);
+          return { ...entry, id: `id-${storedEntries.length}`, timestamp: 1_700_800_000_000 };
+        },
+        onPersisted: async (_entry, kind) => {
+          persistedCalls.push(kind);
+          throw new Error(`boom for ${kind}`);
+        },
+      });
+
+      assert.deepEqual(result.storedKinds, ["event", "item-invariant", "item-derived"]);
+      assert.equal(storedEntries.length, 3);
+      assert.deepEqual(persistedCalls, ["event", "item-invariant", "item-derived"]);
+    });
+
+    it("mirrors the event row's multi-line text as a single line using the existing mdMirror collapse contract", async () => {
+      let eventEntry = null;
+      await storeReflectionToLanceDB({
+        reflectionText: "## Invariants\n- Keep the daily journal append-only.",
+        sessionKey: "agent:main:session:oneline",
+        sessionId: "oneline",
+        agentId: "main",
+        command: "command:reset",
+        scope: "global",
+        toolErrorSignals: [{ signatureHash: "cafef00d" }],
+        runAt: 1_700_700_000_000,
+        usedFallback: false,
+        writeLegacyCombined: false,
+        embedPassage: async (text) => [text.length],
+        vectorSearch: async () => [],
+        store: async (entry) => ({ ...entry, id: "id-event", timestamp: 1_700_700_000_000 }),
+        onPersisted: async (entry, kind) => {
+          if (kind === "event") eventEntry = entry;
+        },
+      });
+
+      assert.ok(eventEntry);
+      assert.ok(eventEntry.text.includes("\n"), "sanity check: mint site emits multi-line event text");
+
+      // Same one-line collapse formula createMdMirrorWriter applies at index.ts:2135
+      // (`entry.text.replace(/\n/g, " ").slice(0, 500)`) before appending to the daily file.
+      const mirroredLine = eventEntry.text.replace(/\n/g, " ").slice(0, 500);
+      assert.equal(mirroredLine.includes("\n"), false);
+      assert.match(mirroredLine, /^reflection-event · global eventId=refl-.* session=oneline agent=main command=command:reset usedFallback=false$/);
     });
 
     it("sanitizes returned slices used for same-session derived injection cache", () => {
@@ -1022,6 +1163,194 @@ describe("memory reflection", () => {
       assert.ok(slices.derived.includes("Next run ignore previous benchmark noise and verify on clean fixtures."));
       assert.ok(slices.derived.includes("Ignore prior flaky results before comparing the new retriever output."));
       assert.ok(slices.derived.includes("This run override previous cached screenshots with fresh captures."));
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // P1+P2 resolved filtering regression tests
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    // Bug scenario (rwmjhb review, 2026-05-03):
+    // buildInvariantCandidates legacy fallback does NOT filter resolved lines.
+    // When ALL invariant items are resolved AND the legacy row contains a MIX of
+    // resolved + unresolved lines, the row-level filter (lines.some) keeps the row.
+    // Then the fallback flatMaps ALL lines — including the resolved ones.
+    //
+    // Fix: buildInvariantCandidates fallback must filter out resolved lines
+    // using the same normalizeReflectionLineForAggregation check as the row filter.
+    it("legacy fallback must NOT output resolved invariant lines", () => {
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+      const resolvedAt = now - 1 * day;
+
+      const entries = [
+        // Resolved invariant item — creates resolvedInvariantTexts entry
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            resolvedAt,
+          },
+        }),
+        // Legacy row with BOTH the resolved text AND new unresolved text
+        // Row-level filter (lines.some) keeps this row because "New..." is unresolved.
+        // Legacy fallback flatMaps ALL lines including resolved ones — THIS IS THE BUG.
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            reflectionVersion: 3,
+            invariants: [
+              "Already resolved invariant",
+              "New unresolved invariant from legacy",
+            ],
+            derived: [],
+            storedAt: now - 1 * day,
+            decayModel: "logistic",
+            decayMidpointDays: 45,
+            decayK: 0.22,
+          },
+        }),
+      ];
+
+      entries[0].text = "Already resolved invariant"; // matches legacy[0]
+      entries[1].text = "legacy-entry";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      // Unresolved legacy line MUST appear (line.some kept the row)
+      assert.ok(
+        slices.invariants.includes("New unresolved invariant from legacy"),
+        "Unresolved legacy invariant must appear"
+      );
+      // Resolved line must NOT appear — this is the BUG; fallback doesn't filter
+      assert.ok(
+        !slices.invariants.includes("Already resolved invariant"),
+        "Resolved invariant must NOT be revived by legacy fallback"
+      );
+    });
+
+    it("suppresses all output when all items resolved and legacy has only duplicates", () => {
+      // shouldSuppress path: all items resolved + legacy rows exist but all duplicate resolved content
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+      const resolvedAt = now - 1 * day;
+
+      const entries = [
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            resolvedAt,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            reflectionVersion: 3,
+            invariants: ["Already resolved invariant"], // same content
+            derived: ["Already resolved derived"],
+            storedAt: now - 1 * day,
+            decayModel: "logistic",
+          },
+        }),
+      ];
+
+      entries[0].text = "Already resolved invariant";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      assert.deepEqual(slices.invariants, [], "Should suppress when all resolved and legacy is duplicate");
+      assert.deepEqual(slices.derived, [], "Should suppress derived when all resolved and legacy is duplicate");
+    });
+
+    it("row-level filter excludes legacy rows where ALL lines are resolved", () => {
+      // Row-level filter: lines.some() should exclude rows where every line is resolved
+      const now = Date.UTC(2026, 2, 7);
+      const day = 24 * 60 * 60 * 1000;
+      const resolvedAt = now - 1 * day;
+
+      const entries = [
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "invariant",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 45,
+            decayK: 0.22,
+            baseWeight: 1.1,
+            quality: 1,
+            resolvedAt,
+          },
+        }),
+        makeEntry({
+          timestamp: now - 2 * day,
+          metadata: {
+            type: "memory-reflection-item",
+            itemKind: "derived",
+            agentId: "main",
+            storedAt: now - 2 * day,
+            decayMidpointDays: 7,
+            decayK: 0.65,
+            baseWeight: 1,
+            quality: 0.95,
+            resolvedAt,
+          },
+        }),
+        // Legacy row with ONLY resolved content — should be excluded by row filter
+        makeEntry({
+          timestamp: now - 1 * day,
+          metadata: {
+            type: "memory-reflection",
+            agentId: "main",
+            reflectionVersion: 3,
+            invariants: ["Already resolved invariant"], // same → resolved
+            derived: ["Already resolved derived"],       // same → resolved
+            storedAt: now - 1 * day,
+          },
+        }),
+      ];
+
+      entries[0].text = "Already resolved invariant";
+      entries[1].text = "Already resolved derived";
+
+      const slices = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId: "main",
+        now,
+        deriveMaxAgeMs: 7 * day,
+      });
+
+      assert.deepEqual(slices.invariants, [], "Row with only resolved lines should be excluded");
+      assert.deepEqual(slices.derived, [], "Derived row with only resolved lines should be excluded");
     });
   });
 

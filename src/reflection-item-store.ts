@@ -14,6 +14,9 @@ export interface ReflectionItemMetadata {
   agentId: string;
   sessionKey: string;
   sessionId: string;
+  l0_abstract: string;
+  l1_overview: string;
+  l2_content: string;
   storedAt: number;
   usedFallback: boolean;
   errorSignals: string[];
@@ -23,6 +26,12 @@ export interface ReflectionItemMetadata {
   baseWeight: number;
   quality: number;
   sourceReflectionPath?: string;
+  /** Unix timestamp when the item was marked resolved. Undefined = unresolved. */
+  resolvedAt?: number;
+  /** Agent ID that marked this item resolved. */
+  resolvedBy?: string;
+  /** Optional note explaining why the item was resolved. */
+  resolutionNote?: string;
 }
 
 export interface ReflectionItemPayload {
@@ -91,6 +100,14 @@ export function buildReflectionItemPayloads(params: BuildReflectionItemPayloadsP
       agentId: params.agentId,
       sessionKey: params.sessionKey,
       sessionId: params.sessionId,
+      // Write-time L0/L1/L2: an item row is one distilled line, so the line is
+      // its own abstract and content; the section heading is the one piece of
+      // extra context worth an overview. Level-less item rows fell back to
+      // three identical lines in every shared pipeline prompt (same fix as
+      // reflection-mapped-metadata).
+      l0_abstract: item.text,
+      l1_overview: `## ${item.section}\n- ${item.text}`,
+      l2_content: item.text,
       storedAt: params.runAt,
       usedFallback: params.usedFallback,
       errorSignals: params.toolErrorSignals.map((signal) => signal.signatureHash),
