@@ -2506,12 +2506,5 @@
       "self_improvement_extract_skill",
       "self_improvement_review"
     ]
-  },
-  "cliCommands": [
-    {
-      "name": "memory-pro",
-      "description": "Manage long-term memories (LanceDB Pro): store, recall, consolidate, stats",
-      "hasSubcommands": true
-    }
-  ]
+  }
 }
