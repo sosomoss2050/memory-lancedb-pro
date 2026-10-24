@@ -2210,6 +2210,24 @@ const memoryLanceDBProPlugin = {
     name: "Memory (LanceDB Pro)",
     description: "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, and management CLI",
     kind: "memory",
+    contracts: {
+        tools: [
+            "memory_recall",
+            "memory_store",
+            "memory_forget",
+            "memory_update",
+            "memory_stats",
+            "memory_debug",
+            "memory_list",
+            "memory_promote",
+            "memory_archive",
+            "memory_compact",
+            "memory_explain_rank",
+            "self_improvement_log",
+            "self_improvement_extract_skill",
+            "self_improvement_review",
+        ],
+    },
     register(api) {
         // Idempotent guard: skip re-init if this exact API instance has already registered.
         if (_registeredApis.has(api)) {
