@@ -28,6 +28,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/fts-search-text-column.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/store-list-stats-projection-fallback.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/recall-text-cleanup.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/native-recall.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/mdmirror-workspace-map-entries.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/openclaw-paths.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/category-filter-normalization.test.mjs", args: ["--test"] },
@@ -105,6 +106,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/reflection-hook-session-memory.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/reflection-before-reset-transcript.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/reflection-runner-embedded-agent.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/cli-metadata-registration.test.mjs", args: ["--test"] },
   // Tier 1 memory counter fix
   { group: "core-regression", runner: "node", file: "test/tier1-counters.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-subsession-prompt-hooks.test.mjs", args: ["--test"] },
@@ -115,6 +117,8 @@ export const CI_TEST_MANIFEST = [
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/pair-window-retention.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/auto-capture-cleanup.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-internal-session-guard.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/reverse-map-legacy-category.test.mjs", args: ["--test"] },
@@ -165,6 +169,13 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/invalidated-rows-visibility.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/store-excludeinactive-default.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/manual-echo-guard.test.mjs", args: ["--test"] },
+  { group: "llm-clients-and-auth", runner: "node", file: "test/host-runtime-lifecycle-error.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-agent-end-owned-run.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-runtime-provenance-classification.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/extraction-transient-retry.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-terminal-flush-retry.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/auto-capture-unknown-watermark-window.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-unknown-watermark-injection.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
